@@ -104,5 +104,7 @@ python eval_scannet.py --input_frame 1000
 
 
 ## ⚖️ License
-The FastVGGT codebase follows VGGT's license, please refer to ./LICENSE.txt for applicable terms.
+The FastVGGT codebase follows VGGT's license, please refer to [LICENSE](./LICENSE.txt) for applicable terms.
+
+Please note that only this [model checkpoint](https://huggingface.co/facebook/VGGT-1B-Commercial) allows commercial usage.
 
