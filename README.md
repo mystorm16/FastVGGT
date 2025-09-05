@@ -104,4 +104,5 @@ python eval_scannet.py --input_frame 1000
 
 
 ## ⚖️ License
-See the [LICENSE](./LICENSE.txt) file for details about the license under which this code is made available.
+The FastVGGT codebase follows VGGT's license, please refer to ./LICENSE.txt for applicable terms.
+
