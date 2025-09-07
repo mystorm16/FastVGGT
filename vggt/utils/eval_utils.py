@@ -370,15 +370,15 @@ def get_vgg_input_imgs(images: np.ndarray):
         img = Image.fromarray(image, mode="RGB")
         width, height = img.size
         # Resize image, maintain aspect ratio, ensure height is multiple of 14
-        new_width = 518
+        new_width = 532
         new_height = round(height * (new_width / width) / 14) * 14
         img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
         img = to_tensor(img)  # Convert to tensor (0, 1)
 
         # If height exceeds 518, perform center cropping
-        if new_height > 518:
-            start_y = (new_height - 518) // 2
-            img = img[:, start_y : start_y + 518, :]
+        if new_height > new_width:
+            start_y = (new_height - new_width) // 2
+            img = img[:, start_y : start_y + new_width, :]
 
         vgg_input_images.append(img)
     vgg_input_images = torch.stack(vgg_input_images)

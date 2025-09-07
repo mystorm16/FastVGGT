@@ -349,6 +349,8 @@ class Aggregator(nn.Module):
                     tokens, global_idx, global_intermediates = (
                         self._process_global_attention(
                             tokens,
+                            H,
+                            W,
                             B,
                             S,
                             P,
@@ -414,6 +416,8 @@ class Aggregator(nn.Module):
     def _process_global_attention(
         self,
         tokens,
+        H,
+        W,
         B,
         S,
         P,
@@ -440,6 +444,8 @@ class Aggregator(nn.Module):
                 tokens,
                 pos=pos,
                 global_merging=global_merging,
+                H=H,
+                W=W,
             )
             global_idx += 1
             if need_intermediates:

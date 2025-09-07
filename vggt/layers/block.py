@@ -79,9 +79,9 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, global_merging=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, global_merging=None, H=0, W=0) -> Tensor:
         norm1_output = self.norm1(x)
-        attn_output = self.attn(norm1_output, pos=pos, global_merging=global_merging)
+        attn_output = self.attn(norm1_output, pos=pos, global_merging=global_merging, H=H, W=W)
         del norm1_output
         x = x + self.ls1(attn_output)
         del attn_output

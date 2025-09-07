@@ -54,7 +54,7 @@ class Attention(nn.Module):
         self.rope = rope
         self.kv_group_size = kv_group_size
 
-    def forward(self, x: Tensor, pos=None, global_merging=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, global_merging=None, H=0, W=0) -> Tensor:
         merge_num = list(range(24))
 
         B, N, C = x.shape
@@ -158,7 +158,7 @@ class Attention(nn.Module):
             r = int(x.shape[1] * merge_ratio)
 
             m, u = token_merge_bipartite2d(
-                x, 37, 28, 2, 2, r, False, generator, enable_protection=True
+                x, W//14, H//14, 2, 2, r, False, generator, enable_protection=True
             )
 
             m_a, u_a = (m, u)
@@ -205,7 +205,7 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(
-        self, x: Tensor, attn_bias=None, pos=None, global_merging=None
+        self, x: Tensor, attn_bias=None, pos=None, global_merging=None, H=0, W=0
     ) -> Tensor:
         assert (
             pos is None or self.rope is not None
