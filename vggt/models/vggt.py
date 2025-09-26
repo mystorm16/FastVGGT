@@ -26,6 +26,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         enable_track=False,
         merging=0,
         vis_attn_map=False,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
     ):
         super().__init__()
 
@@ -37,6 +39,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             embed_dim=embed_dim,
             merging=merging,
             vis_attn_map=vis_attn_map,
+            dtype=dtype,
+            device=device,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

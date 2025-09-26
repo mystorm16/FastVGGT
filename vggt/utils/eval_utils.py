@@ -605,12 +605,12 @@ def infer_vggt_and_reconstruct(
     List[np.ndarray],
     float,
 ]:
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
     start = time.time()
-    with torch.cuda.amp.autocast(dtype=dtype):
-        vgg_input_cuda = vgg_input.cuda().to(torch.bfloat16)
+    with torch.autocast(device_type="cpu", dtype=dtype):
+        vgg_input_cuda = vgg_input.cpu().to(dtype)
         predictions = model(vgg_input_cuda, image_paths=image_paths)
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
 

@@ -216,17 +216,20 @@ def main():
         return
 
     # Force use of bf16 dtype
-    dtype = torch.bfloat16
+    # dtype = torch.bfloat16
+    dtype = torch.float32
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load VGGT model
     print(f"🔄 Loading model: {args.ckpt_path}")
-    model = VGGT(merging=args.merging, vis_attn_map=args.vis_attn_map)
+    model = VGGT(merging=args.merging, vis_attn_map=args.vis_attn_map, dtype=dtype, device=device)
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     incompat = model.load_state_dict(ckpt, strict=False)
     # if incompat.missing_keys or incompat.unexpected_keys:
     #     print(f"⚠️  Partially incompatible keys when loading model: {incompat}")
-    model = model.cuda().eval()
-    model = model.to(torch.bfloat16)
+    # model = model.cuda().eval()
+    model = model.eval()
+    model = model.to(dtype)
     print(f"✅ Model loaded")
 
     # Load scene data
