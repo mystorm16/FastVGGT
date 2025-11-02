@@ -168,11 +168,33 @@ class Attention(nn.Module):
 
             merge_ratio = 0.9
             r = int(x.shape[1] * merge_ratio)
-
+            
+            # 动态计算patch_width和patch_height
+            # 假设每个图像有额外的5个token(相机token和register token)
+            # 尝试找到合适的w和h使得 w*h+5 能整除N
+            num_imgs = 1
+            while (N % (num_imgs) != 0) and (num_imgs < B + 1):
+                num_imgs += 1
+            
+            tokens_per_img = N // num_imgs
+            # 减去5个额外token得到纯patch token数
+            patch_tokens = tokens_per_img - 5
+            
+            # 尝试找到最接近的w和h使得w*h≈patch_tokens
+            import math
+            w = int(math.sqrt(patch_tokens))
+            while patch_tokens % w != 0 and w > 1:
+                w -= 1
+            h = patch_tokens // w if w > 0 else 1
+            
+            # 如果计算失败，使用默认值
+            if w * h != patch_tokens:
+                w, h = self.patch_width, self.patch_height
+            
             m, u = token_merge_bipartite2d(
                 x,
-                self.patch_width,
-                self.patch_height,
+                w,
+                h,
                 2,
                 2,
                 r,

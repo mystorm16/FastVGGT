@@ -217,7 +217,8 @@ def token_merge_bipartite2d(
 
         r = min(a.shape[1], r)
         num_src_actual = a.shape[1]
-        chunk_size = min(5000, num_src_actual)
+        # Ensure chunk_size is at least 1 to avoid range() error
+        chunk_size = max(1, min(5000, num_src_actual))
 
         node_max = torch.empty(B, num_src_actual, device=a.device, dtype=a.dtype)
         node_idx = torch.empty(B, num_src_actual, device=a.device, dtype=torch.long)
