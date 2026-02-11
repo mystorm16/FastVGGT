@@ -2,7 +2,7 @@
 Module Latency Profiling Script for FastVGGT
 
 This script measures the latency of different modules in the FastVGGT model
-across various frame counts and datasets (7Scenes, ScanNet, dummy).
+across various frame counts and datasets (7Scenes, ScanNet, images).
 
 It helps identify bottlenecks and measure the impact of token merging on
 different model components.
@@ -10,7 +10,7 @@ different model components.
 Usage:
     python tests/measure_module_latency.py --dataset_type 7scenes --data_dir /path/to/7scenes
     python tests/measure_module_latency.py --dataset_type scannet --data_dir /path/to/scannet
-    python tests/measure_module_latency.py --dataset_type dummy
+    python tests/measure_module_latency.py --dataset_type images --data_dir /path/to/images
 """
 
 import os
@@ -38,16 +38,6 @@ from vggt.models.vggt import VGGT
 
 # Different frame counts to test
 FRAME_COUNTS = [5, 10, 20]
-
-# Test batch sizes per frame count (adjust for GPU memory)
-BATCH_SIZES = {
-    5: 3,
-    10: 2,
-    20: 1,
-    30: 1,
-    50: 1,
-    100: 1,
-}
 
 # Merge ratios: 0.9 = with merging (fast), 0.0 = no merging (baseline)
 MERGE_RATIOS = [0.9, 0.0]
@@ -284,26 +274,6 @@ def load_generic_images(
     return torch.cat(all_images, dim=0)  # [num_samples, S, 3, H, W]
 
 
-def generate_dummy_data(
-    num_frames: int,
-    batch_size: int = 1,
-    resolution: Tuple[int, int] = (518, 392)
-) -> torch.Tensor:
-    """
-    Generate dummy random data for quick testing.
-    
-    Args:
-        num_frames: Number of frames
-        batch_size: Batch size
-        resolution: Image resolution (H, W)
-        
-    Returns:
-        Tensor of shape [B, S, 3, H, W] with random values in [0, 1]
-    """
-    H, W = resolution
-    return torch.rand(batch_size, num_frames, 3, H, W)
-
-
 # ============================================================================
 # Result Aggregation and Processing
 # ============================================================================
@@ -486,15 +456,15 @@ def main():
     parser.add_argument(
         "--dataset_type",
         type=str,
-        choices=["7scenes", "scannet", "dummy", "images"],
-        default="dummy",
-        help="Type of dataset to use. Default: dummy"
+        choices=["7scenes", "scannet", "images"],
+        default="scannet",
+        help="Type of dataset to use. Default: scannet"
     )
     parser.add_argument(
         "--data_dir",
         type=str,
-        default=None,
-        help="Path to dataset root directory (required for non-dummy datasets)"
+        default="/home/hba/Documents/Dataset/ScanNet/scans/",
+        help="Path to dataset root directory"
     )
     parser.add_argument(
         "--ckpt_path",
@@ -505,7 +475,7 @@ def main():
     parser.add_argument(
         "--output_csv",
         type=str,
-        default="./tests_result/module_latency_report.csv",
+        default=".tests/tests_result/module_latency_report.csv",
         help="Path to save results CSV"
     )
     parser.add_argument(
@@ -518,8 +488,15 @@ def main():
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=1,
+        default=5,
         help="Number of different scenes/samples to test"
+    )
+    parser.add_argument(
+        "--frame_counts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Override global FRAME_COUNTS with a space-separated list (e.g., --frame_counts 5 10 20)"
     )
     args = parser.parse_args()
     
@@ -529,10 +506,9 @@ def main():
     if resolution_tuple not in valid_resolutions and args.dataset_type == "7scenes":
         print(f"⚠ Warning: resolution {resolution_tuple} not in standard options. Using as-is.")
     
-    # Validate data_dir for non-dummy datasets
-    if args.dataset_type != "dummy" and not args.data_dir:
-        print(f"⚠ Warning: dataset_type '{args.dataset_type}' requires --data_dir. Falling back to dummy data.")
-        args.dataset_type = "dummy"
+    # Validate data_dir
+    if not args.data_dir:
+        raise ValueError("--data_dir is required for all dataset types")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -560,9 +536,11 @@ def main():
     
     # Create output directory
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
+
+    frame_counts = args.frame_counts if args.frame_counts else FRAME_COUNTS
     
     # Main testing loop over frame counts
-    for seq_len in tqdm(FRAME_COUNTS, desc="Testing different frame counts"):
+    for seq_len in tqdm(frame_counts, desc="Testing different frame counts"):
         print(f"\n>>> Processing sequence length: {seq_len}")
         
         # Load data
@@ -590,10 +568,7 @@ def main():
                 )
                 dataset_label = "images"
             else:
-                # Default: dummy data
-                batch_size = BATCH_SIZES.get(seq_len, 1)
-                images = generate_dummy_data(seq_len, batch_size=batch_size)
-                dataset_label = "dummy"
+                raise ValueError(f"Unsupported dataset_type: {args.dataset_type}")
         except Exception as e:
             print(f"✗ Error loading data for {args.dataset_type}: {e}")
             continue
