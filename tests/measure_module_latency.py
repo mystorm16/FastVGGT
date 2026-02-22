@@ -1,11 +1,11 @@
 """
 Module Latency Profiling Script for FastVGGT
 
-This script measures the latency of different modules in the FastVGGT model
-across various frame counts and datasets (7Scenes, ScanNet, images).
+This script measures the latency of each module in the FastVGGT model
+across various frame counts and merging settings.
 
-It helps identify bottlenecks and measure the impact of token merging on
-different model components.
+The results include only essential information: frame_count, merge_ratio,
+and per-module inference times.
 
 Usage:
     python tests/measure_module_latency.py --dataset_type 7scenes --data_dir /path/to/7scenes
@@ -21,7 +21,6 @@ import pandas as pd
 import numpy as np
 import argparse
 from tqdm import tqdm
-from collections import defaultdict
 from pathlib import Path
 from typing import Tuple, List, Dict, Optional, Union
 
@@ -33,105 +32,145 @@ if ROOT_DIR not in sys.path:
 from vggt.models.vggt import VGGT
 
 # ============================================================================
-# Global Configuration Variables - Modify these to change testing parameters
+# Global Configuration Variables
 # ============================================================================
 
-# Different frame counts to test
 FRAME_COUNTS = [5, 10, 20]
-
-# Merge ratios: 0.9 = with merging (fast), 0.0 = no merging (baseline)
 MERGE_RATIOS = [0.9, 0.0]
-
-# Number of runs for averaging latency measurements
-NUM_RUNS = 5
+NUM_RUNS = 3  # Number of averaging runs
 
 
 # ============================================================================
-# Timing Utilities
+# Module Timing with Forward Hooks
 # ============================================================================
 
-class CudaTimer:
-    """Context manager for CUDA timing with synchronization."""
+class LatencyProfiler:
+    """Measures per-module inference latency using forward hooks."""
     
-    def __init__(self, name: str, timing_dict: Optional[Dict] = None):
-        self.name = name
-        self.timing_dict = timing_dict
-        self.start_time = None
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self.module_times = {}
+        self.handles = []
+    
+    def _get_module_name(self, module: torch.nn.Module) -> str:
+        """Get a descriptive name for a module."""
+        for name, mod in self.model.named_modules():
+            if mod is module:
+                return name
+        return "unknown"
+    
+    def register_hooks(self):
+        """Register forward hooks on key modules."""
         
-    def __enter__(self):
-        torch.cuda.synchronize()
-        self.start_time = time.time()
-        return self
+        # Aggregator components
+        if hasattr(self.model, 'aggregator'):
+            agg = self.model.aggregator
+            
+            # Patch embed
+            if hasattr(agg, 'patch_embed'):
+                self._hook_module(agg.patch_embed, 'patch_embed')
+            
+            # Frame blocks
+            if hasattr(agg, 'frame_blocks'):
+                for i, block in enumerate(agg.frame_blocks):
+                    self._hook_module(block, f'frame_block_{i}')
+            
+            # Global blocks  
+            if hasattr(agg, 'global_blocks'):
+                for i, block in enumerate(agg.global_blocks):
+                    self._hook_module(block, f'global_block_{i}')
         
-    def __exit__(self, *args):
-        torch.cuda.synchronize()
-        elapsed_ms = (time.time() - self.start_time) * 1000
-        if self.timing_dict is not None:
-            self.timing_dict[self.name] = elapsed_ms
-
-
-def inject_timing_hooks(model: torch.nn.Module) -> None:
-    """
-    Inject timing hooks into model modules to measure latency.
+        # Heads
+        if hasattr(self.model, 'camera_head') and self.model.camera_head is not None:
+            self._hook_module(self.model.camera_head, 'camera_head')
+        
+        if hasattr(self.model, 'depth_head') and self.model.depth_head is not None:
+            self._hook_module(self.model.depth_head, 'depth_head')
+        
+        if hasattr(self.model, 'track_head') and self.model.track_head is not None:
+            self._hook_module(self.model.track_head, 'track_head')
     
-    This function wraps forward methods of key modules with timing.
-    """
-    # Wrap aggregator components
-    original_aggregator_forward = model.aggregator.forward
-    
-    def timed_aggregator_forward(images, timing_info=None):
-        if timing_info is None:
-            timing_info = {}
-        with CudaTimer("aggregator_total", timing_info):
-            return original_aggregator_forward(images, timing_info=timing_info)
-    
-    model.aggregator.forward = timed_aggregator_forward
-    
-    # Wrap head components
-    if model.camera_head is not None:
-        original_camera_forward = model.camera_head.forward
-        def timed_camera_forward(tokens):
-            start = time.time()
+    def _hook_module(self, module: torch.nn.Module, name: str):
+        """Attach timing hooks to a module."""
+        
+        def forward_pre_hook(m, input):
             torch.cuda.synchronize()
-            result = original_camera_forward(tokens)
+            m._time_start = time.time()
+        
+        def forward_hook(m, input, output):
             torch.cuda.synchronize()
-            elapsed_ms = (time.time() - start) * 1000
-            # Store timing in model's timing_dict if available
-            return result
-        model.camera_head.forward = timed_camera_forward
+            elapsed_ms = (time.time() - m._time_start) * 1000
+            if name not in self.module_times:
+                self.module_times[name] = []
+            self.module_times[name].append(elapsed_ms)
+        
+        h1 = module.register_forward_pre_hook(forward_pre_hook)
+        h2 = module.register_forward_hook(forward_hook)
+        self.handles.append(h1)
+        self.handles.append(h2)
     
-    if model.depth_head is not None:
-        original_depth_forward = model.depth_head.forward
-        def timed_depth_forward(aggregated_tokens_list, images, patch_start_idx):
-            start = time.time()
-            torch.cuda.synchronize()
-            result = original_depth_forward(aggregated_tokens_list, images, patch_start_idx)
-            torch.cuda.synchronize()
-            elapsed_ms = (time.time() - start) * 1000
-            return result
-        model.depth_head.forward = timed_depth_forward
+    def reset(self):
+        """Clear timing history."""
+        self.module_times.clear()
+    
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+    
+    def get_avg_times(self) -> Dict[str, float]:
+        """Get average times for each module across runs."""
+        result = {}
+        for name, times in self.module_times.items():
+            if times:
+                result[name] = np.mean(times)
+        return result
 
 
 # ============================================================================
 # Data Loading Functions
 # ============================================================================
 
+def load_7scenes_data(
+    data_dir: str,
+    num_frames: int,
+    resolution: Tuple[int, int] = (518, 392),
+    num_samples: int = 1
+) -> torch.Tensor:
+    """Load 7Scenes data."""
+    sys.path.insert(0, os.path.join(ROOT_DIR, "eval"))
+    from data import SevenScenes
+    
+    dataset = SevenScenes(
+        split="test",
+        ROOT=data_dir,
+        resolution=resolution,
+        num_seq=1,
+        full_video=True,
+        kf_every=1,
+    )
+    
+    all_images = []
+    for idx in range(min(num_samples, len(dataset))):
+        views = dataset[idx]
+        actual_frames = min(num_frames, len(views))
+        selected_views = views[:actual_frames]
+        
+        # Normalize and stack
+        imgs = torch.stack([v["img"] for v in selected_views])
+        imgs = (imgs + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        all_images.append(imgs.unsqueeze(0))
+    
+    return torch.cat(all_images, dim=0)
+
+
 def load_scannet_data(
-    data_dir: Union[str, Path],
+    data_dir: str,
     num_frames: int,
     num_samples: int = 1
 ) -> torch.Tensor:
-    """
-    Load ScanNet data for testing.
-    
-    Args:
-        data_dir: Path to ScanNet root directory
-        num_frames: Number of frames per sample
-        num_samples: Number of different scenes/samples to load
-        
-    Returns:
-        Tensor of shape [B, S, 3, H, W] where B=num_samples, S=num_frames
-    """
+    """Load ScanNet data."""
     from vggt.utils.eval_utils import (
         get_sorted_image_paths, 
         load_images_rgb, 
@@ -141,102 +180,29 @@ def load_scannet_data(
     data_dir = Path(data_dir)
     scenes = sorted([d for d in os.listdir(data_dir) if os.path.isdir(data_dir / d)])
     
-    if not scenes:
-        raise ValueError(f"No scenes found in {data_dir}")
-    
-    num_samples = min(num_samples, len(scenes))
-    selected_scenes = scenes[:num_samples]
-    
     all_images = []
-    for scene in selected_scenes:
+    for scene in scenes[:num_samples]:
         scene_dir = data_dir / scene
         images_dir = scene_dir / "color"
         image_paths = get_sorted_image_paths(images_dir)
         
         actual_frames = min(num_frames, len(image_paths))
-        if len(image_paths) < num_frames:
-            print(f"  Scene {scene}: requested {num_frames} frames, got {actual_frames}")
-        
         selected_paths = image_paths[:actual_frames]
+        
         images = load_images_rgb(selected_paths)
         images_array = np.stack(images)
         vgg_input, _, _ = get_vgg_input_imgs(images_array)
         all_images.append(vgg_input)
     
-    return torch.cat(all_images, dim=0)  # [num_samples, S, 3, H, W]
+    return torch.cat(all_images, dim=0)
 
 
-def load_7scenes_data(
-    data_dir: Union[str, Path],
-    num_frames: int,
-    resolution: Tuple[int, int] = (518, 392),
-    num_samples: int = 1
-) -> torch.Tensor:
-    """
-    Load 7Scenes data for testing.
-    
-    Args:
-        data_dir: Path to 7Scenes root directory
-        num_frames: Number of frames per sample
-        resolution: Input resolution (H, W)
-        num_samples: Number of different sequences to load
-        
-    Returns:
-        Tensor of shape [B, S, 3, H, W] where B=num_samples, S=num_frames
-    """
-    sys.path.append(os.path.join(ROOT_DIR, "eval"))
-    from data import SevenScenes
-    
-    dataset = SevenScenes(
-        split="test",
-        ROOT=str(data_dir),
-        resolution=resolution,
-        num_seq=1,
-        full_video=True,
-        kf_every=1,
-    )
-    
-    if len(dataset) == 0:
-        raise ValueError(f"No data found in 7scenes dataset at {data_dir}")
-    
-    num_samples = min(num_samples, len(dataset))
-    all_images = []
-    
-    for sample_idx in range(num_samples):
-        views = dataset[sample_idx]
-        actual_frames = min(num_frames, len(views))
-        
-        if len(views) < num_frames:
-            print(f"  Sequence {sample_idx}: requested {num_frames} frames, got {len(views)}")
-        
-        selected_views = views[:actual_frames]
-        
-        # Extract and stack images [S, 3, H, W]
-        # Dataset returns images normalized to [-1, 1], convert to [0, 1]
-        imgs = torch.stack([v["img"] for v in selected_views])
-        imgs = (imgs + 1.0) / 2.0
-        
-        all_images.append(imgs.unsqueeze(0))  # [1, S, 3, H, W]
-    
-    return torch.cat(all_images, dim=0)  # [num_samples, S, 3, H, W]
-
-
-def load_generic_images(
-    data_dir: Union[str, Path],
+def load_images(
+    data_dir: str,
     num_frames: int,
     num_samples: int = 1
 ) -> torch.Tensor:
-    """
-    Load images from a directory with flexible sampling.
-    
-    Args:
-        data_dir: Path to image directory
-        num_frames: Number of frames per sample
-        num_samples: Number of different subsets to sample
-        
-    Returns:
-        Tensor of shape [B, S, 3, H, W] where B=num_samples, S=num_frames
-    """
+    """Load generic images."""
     from vggt.utils.eval_utils import (
         get_sorted_image_paths,
         load_images_rgb,
@@ -244,387 +210,170 @@ def load_generic_images(
     )
     
     data_dir = Path(data_dir)
-    if not data_dir.is_dir():
-        raise ValueError(f"Provided path is not a directory: {data_dir}")
-    
     image_paths = get_sorted_image_paths(data_dir)
-    if not image_paths:
-        raise ValueError(f"No images found in {data_dir}")
     
     all_images = []
     total_images = len(image_paths)
-    stride = max(1, total_images // num_samples) if num_samples > 1 else 1
+    stride = max(1, total_images // num_samples)
     
-    for sample_idx in range(num_samples):
-        start_idx = sample_idx * stride
+    for idx in range(num_samples):
+        start_idx = idx * stride
         if start_idx >= total_images:
             break
-        
         end_idx = min(start_idx + num_frames, total_images)
         selected_paths = image_paths[start_idx:end_idx]
-        
-        if len(selected_paths) < num_frames:
-            print(f"  Sample {sample_idx}: requested {num_frames} frames, got {len(selected_paths)}")
         
         images = load_images_rgb(selected_paths)
         images_array = np.stack(images)
         vgg_input, _, _ = get_vgg_input_imgs(images_array)
         all_images.append(vgg_input)
     
-    return torch.cat(all_images, dim=0)  # [num_samples, S, 3, H, W]
+    return torch.cat(all_images, dim=0)
 
 
 # ============================================================================
-# Result Aggregation and Processing
-# ============================================================================
-
-def aggregate_timing_info(
-    timing_dict: Dict[str, float],
-    num_frames: int,
-    seq_len: int,
-    merge_ratio: float,
-    merging: int,
-    dataset_type: str,
-    mode: str,
-    batch_size: int
-) -> Dict:
-    """
-    Aggregate and summarize raw timing measurements.
-    
-    Args:
-        timing_dict: Raw timing dictionary from measurement
-        num_frames: Actual frames processed
-        seq_len: Requested sequence length
-        merge_ratio: Token merge ratio (0.0-1.0)
-        merging: Merging threshold
-        dataset_type: Dataset name
-        mode: 'with_merge' or 'no_merge'
-        batch_size: Batch size used
-        
-    Returns:
-        Dictionary with aggregated metrics
-    """
-    if not timing_dict:
-        return {
-            'seq_len': seq_len,
-            'actual_frames': num_frames,
-            'batch_size': batch_size,
-            'merge_ratio': merge_ratio,
-            'dataset': dataset_type,
-            'mode': mode,
-            'total_time_ms': 0.0,
-            'throughput_fps': 0.0,
-            'top1_module': 'N/A',
-            'top1_time_ms': 0.0,
-            'top1_percent': 0.0,
-            'top5_summary': 'N/A',
-        }
-    
-    total_ms = sum(timing_dict.values())
-    sorted_modules = sorted(timing_dict.items(), key=lambda x: x[1], reverse=True)
-    
-    top1_module = sorted_modules[0][0] if sorted_modules else 'N/A'
-    top1_time = sorted_modules[0][1] if sorted_modules else 0.0
-    top1_percent = (top1_time / total_ms * 100) if total_ms > 0 else 0.0
-    
-    top5_summary = "; ".join([
-        f"{name}:{time:.1f}ms:{time/total_ms*100:.1f}%"
-        for name, time in sorted_modules[:5]
-    ]) if sorted_modules else "N/A"
-    
-    result = {
-        'seq_len': seq_len,
-        'actual_frames': num_frames,
-        'batch_size': batch_size,
-        'merge_ratio': merge_ratio,
-        'merging_threshold': merging,
-        'dataset': dataset_type,
-        'mode': mode,
-        'total_time_ms': round(total_ms, 2),
-        'throughput_fps': round(num_frames / (total_ms / 1000.0), 2) if total_ms > 0 else 0.0,
-        'top1_module': top1_module,
-        'top1_time_ms': round(top1_time, 2),
-        'top1_percent': round(top1_percent, 1),
-        'top5_summary': top5_summary,
-    }
-    
-    return result
-
-
-def save_result_incremental(result_dict: Dict, output_file: str) -> None:
-    """
-    Save result to CSV file incrementally (append mode).
-    
-    Args:
-        result_dict: Single result dictionary to append
-        output_file: Path to CSV file
-    """
-    df = pd.DataFrame([result_dict])
-    file_exists = os.path.isfile(output_file)
-    df.to_csv(
-        output_file,
-        mode='a',
-        header=not file_exists,
-        index=False
-    )
-    print(f"    ✓ Result saved to {output_file}")
-
-
-# ============================================================================
-# Model Latency Measurement
-# ============================================================================
-
-def measure_latency(
-    model: torch.nn.Module,
-    images: torch.Tensor,
-    device: str,
-    merge_ratio: float = 0.9,
-    merging: int = 0
-) -> Dict[str, float]:
-    """
-    Measure module latencies during model forward pass.
-    
-    Args:
-        model: VGGT model
-        images: Input images [B, S, 3, H, W]
-        device: Device to run on ('cuda' or 'cpu')
-        merge_ratio: Token merge ratio
-        merging: Merging threshold
-        
-    Returns:
-        Dictionary of module latencies {module_name: latency_ms}
-    """
-    # Configure merging parameters
-    model.aggregator.merging = merging
-    for block in model.aggregator.frame_blocks:
-        if hasattr(block, 'attn'):
-            block.attn.merge_ratio = merge_ratio
-    for block in model.aggregator.global_blocks:
-        if hasattr(block, 'attn'):
-            block.attn.merge_ratio = merge_ratio
-    
-    # Convert images to device (model is already on device)
-    images = images.to(device).float()
-    
-    # Warmup runs
-    with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        for _ in range(3):
-            try:
-                _ = model(images)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                print(f"    ⚠ OOM during warmup, skipping this configuration")
-                return {}
-    
-    # Measurement runs - measure overall latency
-    total_time_ms = 0.0
-    num_runs = NUM_RUNS
-    
-    for run_idx in range(num_runs):
-        try:
-            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                torch.cuda.synchronize()
-                start_time = time.time()
-                _ = model(images)
-                torch.cuda.synchronize()
-                elapsed_ms = (time.time() - start_time) * 1000
-                total_time_ms += elapsed_ms
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print(f"    ⚠ OOM during run {run_idx+1}/{num_runs}, skipping")
-            return {}
-    
-    avg_time_ms = total_time_ms / num_runs
-    
-    # For now, return a simple dictionary with total time
-    # In future, can add per-module timing by wrapping forward methods
-    timing_info = {
-        'model_total': avg_time_ms
-    }
-    
-    return timing_info
-
-
-# ============================================================================
-# Main Testing Loop
+# Main Script
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Measure FastVGGT module latency with different frame counts"
-    )
-    parser.add_argument(
-        "--dataset_type",
-        type=str,
-        choices=["7scenes", "scannet", "images"],
-        default="scannet",
-        help="Type of dataset to use. Default: scannet"
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/hba/Documents/Dataset/ScanNet/scans/",
-        help="Path to dataset root directory"
-    )
-    parser.add_argument(
-        "--ckpt_path",
-        type=str,
-        default="/home/hba/Documents/FastVGGT/ckpt/model_tracker_fixed_e20.pt",
-        help="Path to model checkpoint"
-    )
-    parser.add_argument(
-        "--output_csv",
-        type=str,
-        default="tests/tests_result/module_latency_report.csv",
-        help="Path to save results CSV"
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        nargs=2,
-        default=[518, 392],
-        help="Input resolution (H W) for 7Scenes. Options: 518 392, 512 384, 224 224"
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=5,
-        help="Number of different scenes/samples to test"
-    )
-    parser.add_argument(
-        "--frame_counts",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Override global FRAME_COUNTS with a space-separated list (e.g., --frame_counts 5 10 20)"
-    )
+    parser = argparse.ArgumentParser(description="Measure module latencies")
+    parser.add_argument("--dataset_type", choices=["7scenes", "scannet", "images"], 
+                       default="7scenes")
+    parser.add_argument("--data_dir", type=str, required=True,
+                       help="Path to dataset")
+    parser.add_argument("--ckpt_path", type=str, 
+                       default="/home/hba/Documents/FastVGGT/ckpt/model_tracker_fixed_e20.pt")
+    parser.add_argument("--resolution", type=int, nargs=2, default=[518, 392],
+                       help="Resolution for 7Scenes (H W)")
+    parser.add_argument("--num_samples", type=int, default=2,
+                       help="Number of samples per config")
+    parser.add_argument("--frame_counts", type=int, nargs="+", default=None)
     args = parser.parse_args()
     
-    # Validate resolution for 7Scenes
-    valid_resolutions = [(518, 392), (512, 384), (224, 224)]
-    resolution_tuple = tuple(args.resolution)
-    if resolution_tuple not in valid_resolutions and args.dataset_type == "7scenes":
-        print(f"⚠ Warning: resolution {resolution_tuple} not in standard options. Using as-is.")
-    
-    # Validate data_dir
-    if not args.data_dir or not os.path.exists(args.data_dir):
-        raise ValueError(f"Invalid or non-existent data_dir: {args.data_dir}")
+    if not os.path.exists(args.data_dir):
+        raise ValueError(f"Data dir not found: {args.data_dir}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
     
-    # Initialize model
-    model = VGGT(
-        merging=0,
-        merge_ratio=0.9,
-        enable_point=True,
-        enable_depth=True,
-        enable_camera=True
-    )
+    # Load model
+    model = VGGT(merging=0, merge_ratio=0.9, enable_point=True, 
+                 enable_depth=True, enable_camera=True)
     
-    if args.ckpt_path and os.path.exists(args.ckpt_path):
+    if os.path.exists(args.ckpt_path):
         ckpt = torch.load(args.ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt, strict=False)
-        print(f"Loaded checkpoint from {args.ckpt_path}")
-    else:
-        print(f"⚠ Warning: checkpoint not found at {args.ckpt_path}, using random initialization")
+        print(f"Loaded checkpoint: {args.ckpt_path}")
     
-    model = model.to(device).eval()
+    model = model.to(device).eval().to(torch.float16)
     
-    # Inject timing hooks for per-module measurements
-    # Note: Currently inject_timing_hooks has compatibility issues with the model's forward signature
-    # Keeping it commented out for now - only measure total time
-    # inject_timing_hooks(model)
+    # Output path (different for each dataset)
+    output_dir = "/home/hba/Documents/FastVGGT/tests/tests_result"
+    os.makedirs(output_dir, exist_ok=True)
+    output_csv = os.path.join(output_dir, f"module_latency_{args.dataset_type}.csv")
     
-    model_dtype = next(model.parameters()).dtype
-    print(f"Model dtype: {model_dtype}")
-    
-    # Create output directory
-    os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
-
     frame_counts = args.frame_counts if args.frame_counts else FRAME_COUNTS
     
-    # Main testing loop over frame counts
-    for seq_len in tqdm(frame_counts, desc="Testing different frame counts"):
-        print(f"\n>>> Processing sequence length: {seq_len}")
-        
+    print(f"\n{'='*60}")
+    print(f"Dataset: {args.dataset_type}")
+    print(f"Output: {output_csv}")
+    print(f"Frame counts: {frame_counts}")
+    print(f"Merge ratios: {MERGE_RATIOS}")
+    print(f"{'='*60}\n")
+    
+    # Main loop
+    results = []
+    
+    for seq_len in tqdm(frame_counts, desc="Testing"):
         # Load data
         try:
             if args.dataset_type == "7scenes":
-                images = load_7scenes_data(
-                    args.data_dir,
-                    seq_len,
-                    resolution=tuple(args.resolution),
-                    num_samples=args.num_samples
-                )
-                dataset_label = f"7scenes(res={tuple(args.resolution)})"
+                images = load_7scenes_data(args.data_dir, seq_len, 
+                                          tuple(args.resolution), args.num_samples)
             elif args.dataset_type == "scannet":
-                images = load_scannet_data(
-                    args.data_dir,
-                    seq_len,
-                    num_samples=args.num_samples
-                )
-                dataset_label = "scannet"
-            elif args.dataset_type == "images":
-                images = load_generic_images(
-                    args.data_dir,
-                    seq_len,
-                    num_samples=args.num_samples
-                )
-                dataset_label = "images"
-            else:
-                raise ValueError(f"Unsupported dataset_type: {args.dataset_type}")
+                images = load_scannet_data(args.data_dir, seq_len, args.num_samples)
+            else:  # images
+                images = load_images(args.data_dir, seq_len, args.num_samples)
         except Exception as e:
-            print(f"✗ Error loading data for {args.dataset_type}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error loading data: {e}")
             continue
         
-        actual_seq_len = images.shape[1]
-        batch_size = images.shape[0]
-        
-        print(f"  Loaded data: shape={images.shape}, dtype={images.dtype}")
-        
-        # Test with different merge ratios
+        # Test each merge ratio
         for merge_ratio in MERGE_RATIOS:
-            mode = 'with_merge' if merge_ratio > 0 else 'no_merge'
             merging_threshold = 0 if merge_ratio > 0 else 25
             
-            print(f"  Measuring {mode} (ratio={merge_ratio})...")
+            mode = 'with_merge' if merge_ratio > 0 else 'no_merge'
             
-            timing_dict = measure_latency(
-                model,
-                images,
-                device,
-                merge_ratio=merge_ratio,
-                merging=merging_threshold
-            )
+            # Configure model
+            model.aggregator.merging = merging_threshold
+            for block in model.aggregator.frame_blocks:
+                if hasattr(block, 'attn'):
+                    block.attn.merge_ratio = merge_ratio
+            for block in model.aggregator.global_blocks:
+                if hasattr(block, 'attn'):
+                    block.attn.merge_ratio = merge_ratio
             
-            if not timing_dict:
-                print(f"    ✓ Skipped due to OOM or other error")
+            # Create profiler
+            profiler = LatencyProfiler(model)
+            profiler.register_hooks()
+            
+            images_device = images.to(device).float()
+            
+            # Warmup
+            with torch.no_grad():
+                for _ in range(2):
+                    try:
+                        _ = model(images_device)
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        print(f"  OOM at frame={seq_len}, {mode}")
+                        profiler.remove_hooks()
+                        continue
+            
+            # Measurement runs
+            for run_idx in range(NUM_RUNS):
+                profiler.reset()
+                try:
+                    with torch.no_grad():
+                        torch.cuda.synchronize()
+                        start = time.time()
+                        _ = model(images_device)
+                        torch.cuda.synchronize()
+                        total_ms = (time.time() - start) * 1000
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print(f"  OOM at frame={seq_len}, {mode}")
+                    profiler.remove_hooks()
+                    break
+            
+            # Get average times
+            avg_times = profiler.get_avg_times()
+            profiler.remove_hooks()
+            
+            if not avg_times:
                 continue
             
-            # Aggregate results
-            result = aggregate_timing_info(
-                timing_dict,
-                actual_seq_len,
-                seq_len,
-                merge_ratio=merge_ratio,
-                merging=merging_threshold,
-                dataset_type=dataset_label,
-                mode=mode,
-                batch_size=batch_size
-            )
+            # Build result row
+            row = {
+                'frame_count': seq_len,
+                'merge_ratio': merge_ratio,
+                'total_ms': total_ms,
+            }
+            row.update(avg_times)
+            results.append(row)
             
-            # Save incrementally
-            save_result_incremental(result, args.output_csv)
-            
-            # Print summary
-            print(f"    Total: {result['total_time_ms']:.2f}ms, "
-                  f"FPS: {result['throughput_fps']:.2f}, "
-                  f"Top module: {result['top1_module']} ({result['top1_percent']:.1f}%)")
+            print(f"  ✓ frame={seq_len}, {mode:12s} total={total_ms:7.2f}ms")
     
-    print(f"\n✓ All tests completed! Results saved to: {args.output_csv}")
+    # Save to CSV
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, index=False)
+        print(f"\n{'='*60}")
+        print(f"✓ Results saved to: {output_csv}")
+        print(f"{'='*60}")
+        print(df.to_string(index=False))
+    else:
+        print("No results to save")
 
 
 if __name__ == "__main__":
