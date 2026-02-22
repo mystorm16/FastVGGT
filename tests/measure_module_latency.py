@@ -15,6 +15,7 @@ Usage:
 
 import os
 import sys
+import gc
 import torch
 import time
 import pandas as pd
@@ -38,11 +39,12 @@ from vggt.models.vggt import VGGT
 
 class LatencyProfiler:
     """Measures per-module inference latency using forward hooks."""
-    
+
     def __init__(self, model: torch.nn.Module):
         self.model = model
         self.module_times = {}
         self.handles = []
+        self.accumulated_times = {}  # Accumulate times across multiple runs
     
     def _get_module_name(self, module: torch.nn.Module) -> str:
         """Get a descriptive name for a module."""
@@ -102,7 +104,13 @@ class LatencyProfiler:
         self.handles.append(h2)
     
     def reset(self):
-        """Clear timing history."""
+        """Clear timing history for current run, but preserve accumulated data."""
+        # Store current run's times into accumulated_times before clearing
+        for name, times in self.module_times.items():
+            if name not in self.accumulated_times:
+                self.accumulated_times[name] = []
+            if times:  # If there are times from current run, store their sum
+                self.accumulated_times[name].append(sum(times))
         self.module_times.clear()
     
     def remove_hooks(self):
@@ -111,13 +119,47 @@ class LatencyProfiler:
             h.remove()
         self.handles.clear()
     
-    def get_avg_times(self) -> Dict[str, float]:
-        """Get average times for each module across runs."""
+    def get_avg_times(self, num_runs: int = 1) -> Dict[str, float]:
+        """Get average times for each module across runs, aggregating frame/global blocks."""
         result = {}
+
+        # First, store the current run's data if any
         for name, times in self.module_times.items():
+            if name not in self.accumulated_times:
+                self.accumulated_times[name] = []
             if times:
-                result[name] = np.mean(times)
+                self.accumulated_times[name].append(sum(times))
+
+        # Aggregate frame_block and global_block times
+        frame_block_totals = []
+        global_block_totals = []
+        
+        for name, run_totals in self.accumulated_times.items():
+            if not run_totals:
+                continue
+            avg_time = np.mean(run_totals)
+            
+            if name.startswith('frame_block_'):
+                frame_block_totals.append(avg_time)
+            elif name.startswith('global_block_'):
+                global_block_totals.append(avg_time)
+            else:
+                # Keep other modules as-is
+                result[name] = avg_time
+        
+        # Add aggregated statistics
+        if frame_block_totals:
+            result['frame_blocks_total'] = sum(frame_block_totals)
+            result['frame_blocks_avg'] = np.mean(frame_block_totals)
+        if global_block_totals:
+            result['global_blocks_total'] = sum(global_block_totals)
+            result['global_blocks_avg'] = np.mean(global_block_totals)
+
         return result
+
+    def clear_accumulated(self):
+        """Clear accumulated times for a new test configuration."""
+        self.accumulated_times.clear()
 
 
 # ============================================================================
@@ -248,7 +290,7 @@ def main():
                        default="/home/hba/Documents/FastVGGT/ckpt/model_tracker_fixed_e20.pt")
     parser.add_argument("--resolution", type=int, nargs=2, default=[518, 392],
                        help="Resolution for 7Scenes (H W)")
-    parser.add_argument("--num_samples", type=int, default=2,
+    parser.add_argument("--num_samples", type=int, default=1,
                        help="Number of samples per config")
     parser.add_argument("--frame_counts", type=int, nargs="+", default=None)
     args = parser.parse_args()
@@ -274,6 +316,9 @@ def main():
     output_dir = "/home/hba/Documents/FastVGGT/tests/tests_result"
     os.makedirs(output_dir, exist_ok=True)
     output_csv = os.path.join(output_dir, f"module_latency_{args.dataset_type}.csv")
+    
+    # Initialize CSV file (will write header on first append)
+    csv_initialized = False
     
     frame_counts = args.frame_counts if args.frame_counts else FRAME_COUNTS
     
@@ -320,36 +365,57 @@ def main():
             profiler = LatencyProfiler(model)
             profiler.register_hooks()
             
-            images_device = images.to(device).float()
+            images_device = images.to(device, dtype=torch.float16)
             
             # Warmup
+            warmup_oom = False
             with torch.no_grad():
-                for _ in range(2):
-                    try:
-                        _ = model(images_device)
-                    except torch.cuda.OutOfMemoryError:
-                        torch.cuda.empty_cache()
-                        print(f"  OOM at frame={seq_len}, {mode}")
-                        profiler.remove_hooks()
-                        continue
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    for _ in range(2):
+                        try:
+                            _ = model(images_device)
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            print(f"  OOM at frame={seq_len}, {mode}")
+                            profiler.remove_hooks()
+                            warmup_oom = True
+                            break
             
-            # Measurement runs
+            if warmup_oom:
+                continue
+            
+            # Discard warmup data without saving to accumulated_times
+            profiler.module_times.clear()
+            
+            # Measurement runs - accumulate times across all runs
+            total_times = []
+            oom_occurred = False
+            
             for run_idx in range(NUM_RUNS):
                 profiler.reset()
                 try:
                     with torch.no_grad():
-                        torch.cuda.synchronize()
-                        start = time.time()
-                        _ = model(images_device)
-                        torch.cuda.synchronize()
-                        total_ms = (time.time() - start) * 1000
+                        with torch.cuda.amp.autocast(dtype=torch.float16):
+                            torch.cuda.synchronize()
+                            start = time.time()
+                            _ = model(images_device)
+                            torch.cuda.synchronize()
+                            elapsed_ms = (time.time() - start) * 1000
+                            total_times.append(elapsed_ms)
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     print(f"  OOM at frame={seq_len}, {mode}")
                     profiler.remove_hooks()
+                    oom_occurred = True
                     break
             
-            # Get average times
+            if oom_occurred:
+                continue
+            
+            # Calculate average total time across all runs
+            avg_total_ms = np.mean(total_times) if total_times else 0.0
+            
+            # Get average times for each module
             avg_times = profiler.get_avg_times()
             profiler.remove_hooks()
             
@@ -360,20 +426,37 @@ def main():
             row = {
                 'frame_count': seq_len,
                 'merge_ratio': merge_ratio,
-                'total_ms': total_ms,
+                'total_ms': avg_total_ms,
             }
             row.update(avg_times)
             results.append(row)
             
-            print(f"  ✓ frame={seq_len}, {mode:12s} total={total_ms:7.2f}ms")
+            print(f"  ✓ frame={seq_len}, {mode:12s} total={avg_total_ms:7.2f}ms")
+            
+            # Append to CSV immediately (after timing is complete)
+            df_row = pd.DataFrame([row])
+            if not csv_initialized:
+                df_row.to_csv(output_csv, index=False, mode='w')
+                csv_initialized = True
+            else:
+                df_row.to_csv(output_csv, index=False, mode='a', header=False)
+            
+            # Clear GPU memory and run garbage collection
+            del images_device, profiler, avg_times, total_times, row, df_row
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Clear loaded images after all merge_ratio tests
+        del images
+        torch.cuda.empty_cache()
+        gc.collect()
     
-    # Save to CSV
+    # Print summary
     if results:
-        df = pd.DataFrame(results)
-        df.to_csv(output_csv, index=False)
         print(f"\n{'='*60}")
         print(f"✓ Results saved to: {output_csv}")
         print(f"{'='*60}")
+        df = pd.DataFrame(results)
         print(df.to_string(index=False))
     else:
         print("No results to save")
