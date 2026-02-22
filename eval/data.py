@@ -130,7 +130,7 @@ class SevenScenes(BaseStereoViewDataset):
         while len(imgs_idxs) > 0:
             im_idx = imgs_idxs.popleft()
             impath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.color.png")
-            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.proj.png")
+            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.png")
             posepath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.pose.txt")
 
             rgb_image = imread_cv2(impath)

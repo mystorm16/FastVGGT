@@ -31,14 +31,6 @@ if ROOT_DIR not in sys.path:
 
 from vggt.models.vggt import VGGT
 
-# ============================================================================
-# Global Configuration Variables
-# ============================================================================
-
-FRAME_COUNTS = [5, 10, 20]
-MERGE_RATIOS = [0.9, 0.0]
-NUM_RUNS = 3  # Number of averaging runs
-
 
 # ============================================================================
 # Module Timing with Forward Hooks
@@ -230,6 +222,16 @@ def load_images(
     
     return torch.cat(all_images, dim=0)
 
+# ============================================================================
+# Global Configuration Variables
+# ============================================================================
+
+FRAME_COUNTS = [5, 10, 20]
+MERGE_RATIOS = [0.9, 0.0]
+NUM_RUNS = 3  # Number of averaging runs
+
+PATH_FOR_7SCENES = "/home/hba/Documents/Dataset/7_scenes"
+PATH_FOR_SCANNET = "/home/hba/Documents/Dataset/ScanNet/scans"
 
 # ============================================================================
 # Main Script
@@ -239,7 +241,8 @@ def main():
     parser = argparse.ArgumentParser(description="Measure module latencies")
     parser.add_argument("--dataset_type", choices=["7scenes", "scannet", "images"], 
                        default="7scenes")
-    parser.add_argument("--data_dir", type=str, required=True,
+    parser.add_argument("--data_dir", type=str,
+                       default=PATH_FOR_7SCENES,
                        help="Path to dataset")
     parser.add_argument("--ckpt_path", type=str, 
                        default="/home/hba/Documents/FastVGGT/ckpt/model_tracker_fixed_e20.pt")
