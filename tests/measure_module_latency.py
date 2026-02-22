@@ -475,7 +475,7 @@ def main():
     parser.add_argument(
         "--output_csv",
         type=str,
-        default=".tests/tests_result/module_latency_report.csv",
+        default="tests/tests_result/module_latency_report.csv",
         help="Path to save results CSV"
     )
     parser.add_argument(
@@ -507,8 +507,8 @@ def main():
         print(f"⚠ Warning: resolution {resolution_tuple} not in standard options. Using as-is.")
     
     # Validate data_dir
-    if not args.data_dir:
-        raise ValueError("--data_dir is required for all dataset types")
+    if not args.data_dir or not os.path.exists(args.data_dir):
+        raise ValueError(f"Invalid or non-existent data_dir: {args.data_dir}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -531,6 +531,11 @@ def main():
     
     model = model.to(device).eval()
     
+    # Inject timing hooks for per-module measurements
+    # Note: Currently inject_timing_hooks has compatibility issues with the model's forward signature
+    # Keeping it commented out for now - only measure total time
+    # inject_timing_hooks(model)
+    
     model_dtype = next(model.parameters()).dtype
     print(f"Model dtype: {model_dtype}")
     
@@ -545,7 +550,7 @@ def main():
         
         # Load data
         try:
-            if args.dataset_type == "7scenes" and args.data_dir:
+            if args.dataset_type == "7scenes":
                 images = load_7scenes_data(
                     args.data_dir,
                     seq_len,
@@ -553,14 +558,14 @@ def main():
                     num_samples=args.num_samples
                 )
                 dataset_label = f"7scenes(res={tuple(args.resolution)})"
-            elif args.dataset_type == "scannet" and args.data_dir:
+            elif args.dataset_type == "scannet":
                 images = load_scannet_data(
                     args.data_dir,
                     seq_len,
                     num_samples=args.num_samples
                 )
                 dataset_label = "scannet"
-            elif args.dataset_type == "images" and args.data_dir:
+            elif args.dataset_type == "images":
                 images = load_generic_images(
                     args.data_dir,
                     seq_len,
@@ -571,6 +576,8 @@ def main():
                 raise ValueError(f"Unsupported dataset_type: {args.dataset_type}")
         except Exception as e:
             print(f"✗ Error loading data for {args.dataset_type}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
         
         actual_seq_len = images.shape[1]
