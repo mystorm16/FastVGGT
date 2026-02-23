@@ -6,11 +6,6 @@ across various frame counts and merging settings.
 
 The results include only essential information: frame_count, merge_ratio,
 and per-module inference times.
-
-Usage:
-    python tests/measure_module_latency.py --dataset_type 7scenes --data_dir /path/to/7scenes
-    python tests/measure_module_latency.py --dataset_type scannet --data_dir /path/to/scannet
-    python tests/measure_module_latency.py --dataset_type images --data_dir /path/to/images
 """
 
 import os
@@ -268,8 +263,8 @@ def load_images(
 # Global Configuration Variables
 # ============================================================================
 
-FRAME_COUNTS = [5, 10, 20]
-MERGE_RATIOS = [0.9, 0.0]
+FRAME_COUNTS = [5, 10, 20, 50, 100]
+MERGE_RATIOS = [0.0]
 NUM_RUNS = 3  # Number of averaging runs
 
 PATH_FOR_7SCENES = "/home/hba/Documents/Dataset/7_scenes"
@@ -313,7 +308,7 @@ def main():
     model = model.to(device).eval().to(torch.float16)
     
     # Output path (different for each dataset)
-    output_dir = "/home/hba/Documents/FastVGGT/tests/tests_result"
+    output_dir = "/home/hba/Documents/FastVGGT/tests/tests_result/module_latency"
     os.makedirs(output_dir, exist_ok=True)
     output_csv = os.path.join(output_dir, f"module_latency_{args.dataset_type}.csv")
     
